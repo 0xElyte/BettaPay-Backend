@@ -59,9 +59,15 @@ test('decrypt: throws on tampered ciphertext', (t) => {
   const password = 'my-password';
 
   const encrypted = encrypt(plaintext, password);
-  
-  // Tamper with the base64 string (change a character)
-  const tampered = encrypted.slice(0, -1) + (encrypted.slice(-1) === 'A' ? 'B' : 'A');
+
+  // Flip a byte in the decoded payload (last byte is always ciphertext, since
+  // the format is salt|iv|authTag|ciphertext). Tampering with the base64
+  // string directly is unreliable: when the raw length mod 3 == 1 the output
+  // ends in '==' padding and changing the final char decodes to identical
+  // bytes, so no authentication failure occurs.
+  const buf = Buffer.from(encrypted, 'base64');
+  buf[buf.length - 1] ^= 0x01;
+  const tampered = buf.toString('base64');
 
   t.throws(
     () => decrypt(tampered, password),

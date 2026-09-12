@@ -19,6 +19,13 @@ import {
 // authenticated merchant, with the IP as the fallback for anonymous traffic
 // and as a nested ceiling for authenticated traffic.
 
+// These tests use intentionally failing payloads, and failed auth attempts
+// feed the IP-reputation scorer (shared Redis, keyed by socket IP — 127.0.0.1
+// under inject). Left at its default threshold it would 429 this suite's own
+// address mid-run and mask the limiter under test, so it is disabled here;
+// reputation blocking is covered by auth-security.test.ts.
+process.env.AUTH_IP_THRESHOLD = '1000000';
+
 // ── Client IP resolution ───────────────────────────────────────────────────
 
 test('resolveClientIp prefers the leftmost X-Forwarded-For entry', (t) => {
@@ -339,7 +346,7 @@ test('the gateway keys its own limits per merchant', async (t) => {
     app.inject({
       method: 'POST',
       url: '/api/auth/challenge',
-      headers: { 'x-forwarded-for': NAT_IP, authorization: `Bearer ${token}` },
+      headers: { 'x-forwarded-for': NAT_IP, authorization: `Bearer ${token}`, 'x-csrf-check': '1' },
       payload: { address: 'GTESTADDRESS' },
     });
 
@@ -379,7 +386,7 @@ test('the gateway enforces its per-route limit per merchant', async (t) => {
     app.inject({
       method: 'POST',
       url: '/api/auth/wallet/verify',
-      headers: { 'x-forwarded-for': NAT_IP, authorization: `Bearer ${token}` },
+      headers: { 'x-forwarded-for': NAT_IP, authorization: `Bearer ${token}`, 'x-csrf-check': '1' },
       payload: {},
     });
 
@@ -420,7 +427,7 @@ test('the gateway keys anonymous traffic per IP', async (t) => {
     app.inject({
       method: 'POST',
       url: '/api/auth/challenge',
-      headers: { 'x-forwarded-for': ip },
+      headers: { 'x-forwarded-for': ip, 'x-csrf-check': '1' },
       payload: { address: 'GTESTADDRESS' },
     });
 

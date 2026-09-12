@@ -107,9 +107,8 @@ const adapterContent = fs.readFileSync(adapterPath, 'utf-8');
 
 test('prisma-adapter exists and avoids upsert', (t) => {
   t.ok(fs.existsSync(adapterPath), 'prisma-adapter.ts should exist');
-  t.notMatch(
-    adapterContent,
-    /\.upsert\s*\(/,
+  t.ok(
+    !/\.upsert\s*\(/.test(adapterContent),
     'adapter must not use Prisma upsert (create + unique-constraint handling instead)',
   );
   t.match(
@@ -150,9 +149,12 @@ test('prisma-adapter index.ts imports the adapter helpers', (t) => {
 });
 
 // ── Transaction isolation tests ───────────────────────────────────────────────
-// Issue #497: Add tests for Prisma adapter transaction isolation
+// Issue #497: Prisma adapter transaction isolation (DB-backed).
+//
+// Written in tape (the repo standard — vitest is not a dependency).
+// These need a live PostgreSQL with the schema pushed; they SKIP cleanly when
+// it is unavailable, exactly like the payment-to-settlement integration test.
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { PrismaClient } from '@prisma/client';
 import {
   createSettlementWithUniqueGuard,
@@ -161,34 +163,43 @@ import {
   UniqueConstraintError,
 } from './prisma-adapter.js';
 
-describe('Prisma Adapter Transaction Isolation (#497)', () => {
+async function connectTxPrisma(): Promise<PrismaClient> {
+  const prisma = new PrismaClient();
+  await prisma.$queryRaw`SELECT 1`;
+  return prisma;
+}
+
+async function resetTxDb(prisma: PrismaClient): Promise<void> {
+  await prisma.settlement.deleteMany({});
+  await prisma.merchant.deleteMany({});
+  await prisma.merchant.create({
+    data: {
+      id: 'merchant-tx-test',
+      name: 'Transaction Test',
+      ownerId: 'owner-1',
+    },
+  });
+}
+
+async function teardownTxDb(prisma: PrismaClient): Promise<void> {
+  await prisma.settlement.deleteMany({}).catch(() => {});
+  await prisma.merchant.deleteMany({}).catch(() => {});
+  await prisma.$disconnect().catch(() => {});
+}
+
+test('prisma-adapter (#497): rolls back the transaction on error', async (t) => {
   let prisma: PrismaClient;
-
-  beforeEach(async () => {
-    prisma = new PrismaClient();
-    await prisma.settlement.deleteMany({});
-    await prisma.merchant.deleteMany({});
-
-    // Create test merchant
-    await prisma.merchant.create({
-      data: {
-        id: 'merchant-tx-test',
-        name: 'Transaction Test',
-        ownerId: 'owner-1',
-      },
-    });
-  });
-
-  afterEach(async () => {
-    await prisma.settlement.deleteMany({});
-    await prisma.merchant.deleteMany({});
-    await prisma.$disconnect();
-  });
-
-  it('should rollback transaction on error', async () => {
+  try {
+    prisma = await connectTxPrisma();
+  } catch (err) {
+    t.skip(`PostgreSQL unavailable: ${err}`);
+    t.end();
+    return;
+  }
+  try {
+    await resetTxDb(prisma);
     try {
       await prisma.$transaction(async (tx) => {
-        // Create settlement
         const settlement = await tx.settlement.create({
           data: {
             id: 'stl-rollback-test',
@@ -202,26 +213,37 @@ describe('Prisma Adapter Transaction Isolation (#497)', () => {
             status: 'pending',
           },
         });
-
-        expect(settlement.id).toBe('stl-rollback-test');
-
-        // Throw error to trigger rollback
+        t.equal(settlement.id, 'stl-rollback-test', 'created inside the transaction');
         throw new Error('Intentional rollback test');
       });
+      t.fail('transaction should have thrown');
     } catch (err) {
-      // Expected
-      expect((err as Error).message).toContain('Intentional rollback test');
+      t.ok(
+        (err as Error).message.includes('Intentional rollback test'),
+        'transaction error surfaces',
+      );
     }
-
-    // Verify settlement was not created (rolled back)
     const settlement = await prisma.settlement.findUnique({
       where: { id: 'stl-rollback-test' },
     });
-    expect(settlement).toBeNull();
-  });
+    t.equal(settlement, null, 'rolled-back row is absent');
+  } finally {
+    await teardownTxDb(prisma!);
+  }
+  t.end();
+});
 
-  it('should handle concurrent updates with transaction isolation', async () => {
-    // Create initial settlement
+test('prisma-adapter (#497): handles concurrent updates with transaction isolation', async (t) => {
+  let prisma: PrismaClient;
+  try {
+    prisma = await connectTxPrisma();
+  } catch (err) {
+    t.skip(`PostgreSQL unavailable: ${err}`);
+    t.end();
+    return;
+  }
+  try {
+    await resetTxDb(prisma);
     const initial = await prisma.settlement.create({
       data: {
         id: 'stl-concurrent-test',
@@ -237,7 +259,6 @@ describe('Prisma Adapter Transaction Isolation (#497)', () => {
       },
     });
 
-    // Simulate concurrent updates
     const updates = await Promise.allSettled([
       prisma.settlement.update({
         where: { id: initial.id },
@@ -249,19 +270,31 @@ describe('Prisma Adapter Transaction Isolation (#497)', () => {
       }),
     ]);
 
-    // Both updates should succeed
-    expect(updates[0].status).toBe('fulfilled');
-    expect(updates[1].status).toBe('fulfilled');
+    t.equal(updates[0].status, 'fulfilled', 'first concurrent update succeeds');
+    t.equal(updates[1].status, 'fulfilled', 'second concurrent update succeeds');
 
-    // Verify final state reflects both updates
     const final = await prisma.settlement.findUnique({
       where: { id: initial.id },
     });
-    expect(final?.status).toBe('processing');
-    expect(final?.completedAt).toBeDefined();
-  });
+    t.equal(final?.status, 'processing', 'final state reflects the status update');
+    t.ok(final?.completedAt, 'final state reflects the completion timestamp');
+  } finally {
+    await teardownTxDb(prisma!);
+  }
+  t.end();
+});
 
-  it('should verify idempotent updates within transaction', async () => {
+test('prisma-adapter (#497): verifies idempotent updates within transactions', async (t) => {
+  let prisma: PrismaClient;
+  try {
+    prisma = await connectTxPrisma();
+  } catch (err) {
+    t.skip(`PostgreSQL unavailable: ${err}`);
+    t.end();
+    return;
+  }
+  try {
+    await resetTxDb(prisma);
     const settlement = await prisma.settlement.create({
       data: {
         id: 'stl-idempotent-test',
@@ -276,7 +309,6 @@ describe('Prisma Adapter Transaction Isolation (#497)', () => {
       },
     });
 
-    // Apply same update twice via transaction
     const update1 = await prisma.$transaction(async (tx) => {
       return tx.settlement.update({
         where: { id: settlement.id },
@@ -291,14 +323,26 @@ describe('Prisma Adapter Transaction Isolation (#497)', () => {
       });
     });
 
-    // Both should reflect the same state
-    expect(update1.status).toBe('processing');
-    expect(update2.status).toBe('processing');
-    expect(update1.id).toBe(update2.id);
-  });
+    t.equal(update1.status, 'processing', 'first update applies');
+    t.equal(update2.status, 'processing', 'repeated update applies');
+    t.equal(update1.id, update2.id, 'both updates target the same row');
+  } finally {
+    await teardownTxDb(prisma!);
+  }
+  t.end();
+});
 
-  it('should handle partial failures within transactions', async () => {
-    // Create two settlements
+test('prisma-adapter (#497): handles partial failures within transactions', async (t) => {
+  let prisma: PrismaClient;
+  try {
+    prisma = await connectTxPrisma();
+  } catch (err) {
+    t.skip(`PostgreSQL unavailable: ${err}`);
+    t.end();
+    return;
+  }
+  try {
+    await resetTxDb(prisma);
     const stl1 = await prisma.settlement.create({
       data: {
         id: 'stl-partial-1',
@@ -329,129 +373,167 @@ describe('Prisma Adapter Transaction Isolation (#497)', () => {
 
     try {
       await prisma.$transaction(async (tx) => {
-        // Update first settlement
         await tx.settlement.update({
           where: { id: stl1.id },
           data: { status: 'processing' },
         });
-
-        // Try to update non-existent settlement (should fail)
         await tx.settlement.update({
           where: { id: 'non-existent-id' },
           data: { status: 'processing' },
         });
       });
+      t.fail('transaction touching a missing row should have thrown');
     } catch (err) {
-      // Expected to fail
-      expect((err as Error).message).toBeDefined();
+      t.ok((err as Error).message, 'partial failure surfaces an error');
     }
 
-    // Verify first settlement update was rolled back
     const updatedStl1 = await prisma.settlement.findUnique({ where: { id: stl1.id } });
-    expect(updatedStl1?.status).toBe('pending');
+    t.equal(updatedStl1?.status, 'pending', 'first update was rolled back');
 
-    // Second settlement should be unchanged
     const unchangedStl2 = await prisma.settlement.findUnique({ where: { id: stl2.id } });
-    expect(unchangedStl2?.status).toBe('pending');
-  });
+    t.equal(unchangedStl2?.status, 'pending', 'untouched row is unchanged');
+  } finally {
+    await teardownTxDb(prisma!);
+  }
+  t.end();
 });
 
 // ── Adapter unit tests (in-memory mocks, no DB required) ─────────────────────
+// Issue #543: concurrency-safe create / optimistic-lock update.
 
-describe('Settlement Prisma Adapter (#543)', () => {
-  function makeMockPrisma(overrides?: {
-    existingById?: Record<string, unknown>;
-    existingByKey?: Record<string, unknown>;
-    updateCount?: number;
-  }) {
-    const store: Record<string, unknown> = {};
-    const mockPrisma = {
-      settlement: {
-        create: vi.fn(async ({ data }: { data: Record<string, unknown> }) => {
-          return { ...(data as object), version: 0 } as unknown as Settlement;
-        }),
-        findUnique: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
-          if ('id' in where) {
-            return (overrides?.existingById?.[where.id as string] as Settlement) ?? null;
-          }
-          if ('idempotencyKey' in where) {
-            return (overrides?.existingByKey?.[where.idempotencyKey as string] as Settlement) ?? null;
-          }
-          return null;
-        }),
-        updateMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
-          return { count: overrides?.updateCount ?? 1 };
-        }),
-      },
-    };
-    return { mockPrisma, store };
+/** Minimal mock-function helper (the repo does not depend on a mocking library). */
+function mockFn<T extends (...args: any[]) => any>(impl?: T) {
+  const calls: any[][] = [];
+  const onceRejections: unknown[] = [];
+  const fn = (async (...args: any[]) => {
+    calls.push(args);
+    if (onceRejections.length > 0) {
+      throw onceRejections.shift();
+    }
+    return impl?.(...args);
+  }) as T & {
+    calls: any[][];
+    mockRejectedValueOnce: (err: unknown) => void;
+  };
+  fn.calls = calls;
+  fn.mockRejectedValueOnce = (err: unknown) => {
+    onceRejections.push(err);
+  };
+  return fn;
+}
+
+function makeMockPrisma(overrides?: {
+  existingById?: Record<string, unknown>;
+  existingByKey?: Record<string, unknown>;
+  updateCount?: number;
+}) {
+  const mockPrisma = {
+    settlement: {
+      create: mockFn(async ({ data }: { data: Record<string, unknown> }) => {
+        return { ...(data as object), version: 0 };
+      }),
+      findUnique: mockFn(async ({ where }: { where: Record<string, unknown> }) => {
+        if ('id' in where) {
+          return (overrides?.existingById?.[where.id as string] as unknown) ?? null;
+        }
+        if ('idempotencyKey' in where) {
+          return (overrides?.existingByKey?.[where.idempotencyKey as string] as unknown) ?? null;
+        }
+        return null;
+      }),
+      updateMany: mockFn(async () => {
+        return { count: overrides?.updateCount ?? 1 };
+      }),
+    },
+  };
+  return { mockPrisma };
+}
+
+test('prisma-adapter (#543): createSettlementWithUniqueGuard creates a new settlement', async (t) => {
+  const { mockPrisma } = makeMockPrisma();
+  const result = await createSettlementWithUniqueGuard(mockPrisma as any, {
+    id: 'set_new',
+    merchantId: 'm1',
+    status: 'pending',
+  } as any);
+  t.equal((result as { id: string }).id, 'set_new', 'returns the created row');
+  t.equal(mockPrisma.settlement.create.calls.length, 1, 'create called once');
+  t.end();
+});
+
+test('prisma-adapter (#543): createSettlementWithUniqueGuard returns existing record on P2002', async (t) => {
+  const existing = { id: 'set_existing', merchantId: 'm1', status: 'pending', version: 0 };
+  const { mockPrisma } = makeMockPrisma({
+    existingById: { set_existing: existing },
+  });
+
+  mockPrisma.settlement.create.mockRejectedValueOnce({ code: 'P2002' });
+
+  const result = await createSettlementWithUniqueGuard(mockPrisma as any, {
+    id: 'set_existing',
+    merchantId: 'm1',
+    status: 'pending',
+  } as any);
+
+  t.deepEqual(result, existing, 'returns the pre-existing row');
+  t.deepEqual(
+    mockPrisma.settlement.findUnique.calls[0][0],
+    { where: { id: 'set_existing' } },
+    'looks up the conflicting row by id',
+  );
+  t.end();
+});
+
+test('prisma-adapter (#543): createSettlementWithUniqueGuard throws UniqueConstraintError when existing record is not found', async (t) => {
+  const { mockPrisma } = makeMockPrisma();
+  mockPrisma.settlement.create.mockRejectedValueOnce({ code: 'P2002' });
+
+  try {
+    await createSettlementWithUniqueGuard(mockPrisma as any, {
+      id: 'set_missing',
+      merchantId: 'm1',
+      status: 'pending',
+    } as any);
+    t.fail('should have thrown UniqueConstraintError');
+  } catch (err) {
+    t.ok(err instanceof UniqueConstraintError, 'throws UniqueConstraintError');
   }
+  t.end();
+});
 
-  it('createSettlementWithUniqueGuard creates a new settlement', async () => {
-    const { mockPrisma } = makeMockPrisma();
-    const result = await createSettlementWithUniqueGuard(mockPrisma as any, {
-      id: 'set_new',
-      merchantId: 'm1',
-      status: 'pending',
-    } as any);
-    expect(result.id).toBe('set_new');
-    expect(mockPrisma.settlement.create).toHaveBeenCalledTimes(1);
+test('prisma-adapter (#543): updateSettlementWithOptimisticLock increments version on success', async (t) => {
+  const { mockPrisma } = makeMockPrisma({
+    existingById: { set_1: { id: 'set_1', version: 4, status: 'processing' } },
   });
-
-  it('createSettlementWithUniqueGuard returns existing record on P2002', async () => {
-    const existing = { id: 'set_existing', merchantId: 'm1', status: 'pending', version: 0 };
-    const { mockPrisma } = makeMockPrisma({
-      existingById: { set_existing: existing },
-    });
-
-    mockPrisma.settlement.create.mockRejectedValueOnce({ code: 'P2002' });
-
-    const result = await createSettlementWithUniqueGuard(mockPrisma as any, {
-      id: 'set_existing',
-      merchantId: 'm1',
-      status: 'pending',
-    } as any);
-
-    expect(result).toEqual(existing);
-    expect(mockPrisma.settlement.findUnique).toHaveBeenCalledWith({ where: { id: 'set_existing' } });
+  const result = await updateSettlementWithOptimisticLock(mockPrisma as any, {
+    id: 'set_1',
+    expectedVersion: 3,
+    data: { status: 'processing' },
   });
-
-  it('createSettlementWithUniqueGuard throws UniqueConstraintError when existing record is not found', async () => {
-    const { mockPrisma } = makeMockPrisma();
-    mockPrisma.settlement.create.mockRejectedValueOnce({ code: 'P2002' });
-
-    await expect(
-      createSettlementWithUniqueGuard(mockPrisma as any, {
-        id: 'set_missing',
-        merchantId: 'm1',
-        status: 'pending',
-      } as any),
-    ).rejects.toBeInstanceOf(UniqueConstraintError);
-  });
-
-  it('updateSettlementWithOptimisticLock increments version on success', async () => {
-    const { mockPrisma } = makeMockPrisma();
-    const result = await updateSettlementWithOptimisticLock(mockPrisma as any, {
-      id: 'set_1',
-      expectedVersion: 3,
-      data: { status: 'processing' },
-    });
-    expect(result).toBeDefined();
-    expect(mockPrisma.settlement.updateMany).toHaveBeenCalledWith({
+  t.ok(result, 'returns the updated row');
+  t.deepEqual(
+    mockPrisma.settlement.updateMany.calls[0][0],
+    {
       where: { id: 'set_1', version: 3 },
       data: { status: 'processing', version: { increment: 1 } },
+    },
+    'update is guarded by the expected version and bumps it',
+  );
+  t.end();
+});
+
+test('prisma-adapter (#543): updateSettlementWithOptimisticLock throws VersionConflictError on stale version', async (t) => {
+  const { mockPrisma } = makeMockPrisma({ updateCount: 0 });
+
+  try {
+    await updateSettlementWithOptimisticLock(mockPrisma as any, {
+      id: 'set_1',
+      expectedVersion: 2,
+      data: { status: 'processing' },
     });
-  });
-
-  it('updateSettlementWithOptimisticLock throws VersionConflictError on stale version', async () => {
-    const { mockPrisma } = makeMockPrisma({ updateCount: 0 });
-
-    await expect(
-      updateSettlementWithOptimisticLock(mockPrisma as any, {
-        id: 'set_1',
-        expectedVersion: 2,
-        data: { status: 'processing' },
-      }),
-    ).rejects.toBeInstanceOf(VersionConflictError);
-  });
+    t.fail('should have thrown VersionConflictError');
+  } catch (err) {
+    t.ok(err instanceof VersionConflictError, 'throws VersionConflictError');
+  }
+  t.end();
 });

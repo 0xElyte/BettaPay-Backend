@@ -345,5 +345,3 @@ test('#509 — startup fails cleanly when Redis is unavailable after retries', a
   t.ok(startErrors[0].message.includes('aborting startup'), 'error carries abort message');
   t.end();
 });
-
-process.exit(0);

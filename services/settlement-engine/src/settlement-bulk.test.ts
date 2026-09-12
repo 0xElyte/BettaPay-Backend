@@ -1,6 +1,6 @@
 import test from 'tape';
 import crypto from 'node:crypto';
-import { fastify, prisma, settlementQueue, redis } from './index.js';
+import { fastify, prisma, settlementQueue, redis, closeTestResources } from './index.js';
 import {
   MOCK_MERCHANT_STANDARD,
   MOCK_MERCHANT_TIGHT_LIMITS,
@@ -96,14 +96,14 @@ test('POST /api/settlements/bulk: processes valid batch successfully', async (t)
   t.equal(res.statusCode, 201, 'should return 201 Created');
   const body = JSON.parse(res.body);
 
-  t.ok(body.batchId.startsWith('batch_'), 'batchId should be generated');
-  t.equal(body.total, 3, 'should report correct total count');
-  t.equal(body.created, 3, 'should report correct created count');
-  t.equal(body.errors.length, 0, 'should have no errors');
+  t.ok(body.data.batchId.startsWith('batch_'), 'batchId should be generated');
+  t.equal(body.data.total, 3, 'should report correct total count');
+  t.equal(body.data.created, 3, 'should report correct created count');
+  t.equal(body.data.errors.length, 0, 'should have no errors');
 
   t.equal(createdRecords.length, 3, 'should write 3 database records');
   t.equal(enqueuedJobs.length, 3, 'should enqueue 3 BullMQ jobs');
-  t.equal(createdRecords[0].batchId, body.batchId, 'records should share batchId');
+  t.equal(createdRecords[0].batchId, body.data.batchId, 'records should share batchId');
   t.end();
 });
 
@@ -129,11 +129,11 @@ test('POST /api/settlements/bulk: handles partial failures (min amount violation
   t.equal(res.statusCode, 201, 'returns 201 Created');
   const body = JSON.parse(res.body);
 
-  t.equal(body.total, 3, 'total settlements is 3');
-  t.equal(body.created, 2, 'created count is 2 due to 1 limit violation');
-  t.equal(body.errors.length, 1, 'contains 1 error description');
-  t.equal(body.errors[0].index, 1, 'error occurred at index 1');
-  t.ok(body.errors[0].reason.includes('below minimum'), 'reports below minimum error');
+  t.equal(body.data.total, 3, 'total settlements is 3');
+  t.equal(body.data.created, 2, 'created count is 2 due to 1 limit violation');
+  t.equal(body.data.errors.length, 1, 'contains 1 error description');
+  t.equal(body.data.errors[0].index, 1, 'error occurred at index 1');
+  t.ok(body.data.errors[0].reason.includes('below minimum'), 'reports below minimum error');
   t.equal(createdRecords.length, 2, 'only 2 records created in DB');
   t.end();
 });
@@ -160,11 +160,11 @@ test('POST /api/settlements/bulk: handles partial failures (max amount violation
   t.equal(res.statusCode, 201, 'returns 201');
   const body = JSON.parse(res.body);
 
-  t.equal(body.total, 3);
-  t.equal(body.created, 2);
-  t.equal(body.errors.length, 1);
-  t.equal(body.errors[0].index, 1);
-  t.ok(body.errors[0].reason.includes('exceeds maximum'), 'reports exceeds maximum error');
+  t.equal(body.data.total, 3);
+  t.equal(body.data.created, 2);
+  t.equal(body.data.errors.length, 1);
+  t.equal(body.data.errors[0].index, 1);
+  t.ok(body.data.errors[0].reason.includes('exceeds maximum'), 'reports exceeds maximum error');
   t.end();
 });
 
@@ -187,15 +187,15 @@ test('POST /api/settlements/bulk: handles daily limits aggregation check', async
   t.equal(res.statusCode, 201);
   const body = JSON.parse(res.body);
 
-  t.equal(body.total, 3);
+  t.equal(body.data.total, 3);
   // Item 0 (4000) fits (5000+4000 <= 10000)
   // Item 1 (5000) fails (5000+4000+5000 > 10000)
   // Item 2 (2000) fails cumulative daily check (5000+4000+2000 > 10000)
-  t.equal(body.created, 1);
-  t.equal(body.errors.length, 2);
-  t.equal(body.errors[0].index, 1);
-  t.equal(body.errors[1].index, 2);
-  t.ok(body.errors[0].reason.includes('daily settlement limit exceeded'), 'reports daily limit exceeded');
+  t.equal(body.data.created, 1);
+  t.equal(body.data.errors.length, 2);
+  t.equal(body.data.errors[0].index, 1);
+  t.equal(body.data.errors[1].index, 2);
+  t.ok(body.data.errors[0].reason.includes('Daily settlement limit exceeded'), 'reports daily limit exceeded');
   t.end();
 });
 
@@ -216,11 +216,11 @@ test('POST /api/settlements/bulk: filters out invalid amount formats', async (t)
   t.equal(res.statusCode, 201);
   const body = JSON.parse(res.body);
 
-  t.equal(body.total, 4);
-  t.equal(body.created, 2); // only index 0 and 3 are valid
-  t.equal(body.errors.length, 2);
-  t.equal(body.errors[0].index, 1);
-  t.equal(body.errors[1].index, 2);
+  t.equal(body.data.total, 4);
+  t.equal(body.data.created, 2); // only index 0 and 3 are valid
+  t.equal(body.data.errors.length, 2);
+  t.equal(body.data.errors[0].index, 1);
+  t.equal(body.data.errors[1].index, 2);
   t.end();
 });
 
@@ -245,12 +245,12 @@ test('GET /api/settlements/batch/:batchId/status: tracks progress of existing ba
   t.equal(res.statusCode, 200, 'returns 200 OK');
   const body = JSON.parse(res.body);
 
-  t.equal(body.batchId, 'batch_test123');
-  t.equal(body.total, 4);
-  t.equal(body.completed, 2);
-  t.equal(body.pending, 1);
-  t.equal(body.failed, 1);
-  t.equal(body.status, 'processing');
+  t.equal(body.data.batchId, 'batch_test123');
+  t.equal(body.data.total, 4);
+  t.equal(body.data.completed, 2);
+  t.equal(body.data.pending, 1);
+  t.equal(body.data.failed, 1);
+  t.equal(body.data.status, 'processing');
   t.end();
 });
 
@@ -340,3 +340,10 @@ test('POST /api/settlements/bulk: rejects same idempotency key with different pa
   t.end();
 });
 
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
+  t.end();
+});

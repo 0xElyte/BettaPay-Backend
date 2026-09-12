@@ -20,12 +20,14 @@
  */
 
 import test from 'tape';
+import crypto from 'crypto';
 import {
   createWebhookQueue,
   createWebhookWorker,
   signPayload,
   verifySignature,
   canonicalize,
+  resolveWebhookConcurrency,
   WEBHOOK_DEFAULTS,
   type WebhookJobData,
   type WebhookLogger,
@@ -184,6 +186,7 @@ function extractProcessor(
   fetchImpl: typeof fetch,
   loggerOverride?: WebhookLogger,
   redisOverride?: DedupRedis,
+  workerOpts?: { timeoutMs?: number },
 ): ((job: FakeJob) => Promise<void>) | null {
   let captured: ((job: FakeJob) => Promise<void>) | null = null;
 
@@ -221,6 +224,7 @@ function extractProcessor(
       logger: loggerOverride,
       concurrency: 1,
       redis: redisOverride,
+      timeoutMs: workerOpts?.timeoutMs,
     });
 
     // BullMQ v5 stores the processor as `processFn` on the Worker instance
@@ -466,8 +470,7 @@ test('migration note — indexer queue name constant is documented', (t) => {
 
 test('resolveWebhookConcurrency — returns default when WEBHOOK_CONCURRENCY unset', (t) => {
   delete process.env.WEBHOOK_CONCURRENCY;
-  const { resolveWebhookConcurrency } = require('./index.js');
-  
+
   t.equal(resolveWebhookConcurrency(), 10, 'default is 10');
   t.equal(resolveWebhookConcurrency(20), 20, 'custom default is respected');
   t.end();
@@ -475,17 +478,14 @@ test('resolveWebhookConcurrency — returns default when WEBHOOK_CONCURRENCY uns
 
 test('resolveWebhookConcurrency — honors WEBHOOK_CONCURRENCY env var', (t) => {
   process.env.WEBHOOK_CONCURRENCY = '25';
-  const { resolveWebhookConcurrency } = require('./index.js');
-  
+
   t.equal(resolveWebhookConcurrency(), 25, 'env var overrides default');
-  
+
   delete process.env.WEBHOOK_CONCURRENCY;
   t.end();
 });
 
 test('resolveWebhookConcurrency — falls back to default for invalid env var', (t) => {
-  const { resolveWebhookConcurrency } = require('./index.js');
-  
   process.env.WEBHOOK_CONCURRENCY = 'not-a-number';
   t.equal(resolveWebhookConcurrency(), 10, 'invalid string falls back to default');
   
@@ -542,44 +542,59 @@ test('createWebhookWorker — explicit concurrency option overrides env var (#51
 
 // ── Part 7: Socket cleanup in finally block (#517) ────────────────────────────
 
-test('worker processor — cleans up timer and aborts controller on success (#517)', async (t) => {
-  let abortCalled = false;
-  let timeoutCleared = false;
-  
-  // Track AbortController.abort() calls
-  const mockAbort = () => {
-    abortCalled = true;
-  };
-  
-  const mockFetch: typeof fetch = async (_url, init) => {
-    // Monkey-patch the abort method to track calls
-    if (init?.signal) {
-      const originalAbort = (init.signal as any).abort;
-      (init.signal as any).abort = () => {
-        mockAbort();
-        if (originalAbort) originalAbort.call(init.signal);
-      };
-    }
-    return { ok: true, status: 200 } as Response;
-  };
-  
-  // Track setTimeout/clearTimeout
+// The processor runs alongside BullMQ/ioredis internals that also schedule
+// timers, so tracking a single "last timer id" is racy — a reconnect timer
+// can overwrite it mid-test.  Instead we record every timer id together with
+// its delay and report clearance per delay value.  AbortController.prototype
+// is spied because the implementation calls controller.abort() (AbortSignal
+// itself has no abort method, so patching signal.abort observes nothing).
+function installCleanupSpies() {
+  const delayByTimer = new Map<unknown, number>();
+  const clearedDelays = new Set<number>();
+  let abortCalls = 0;
+
   const originalSetTimeout = global.setTimeout;
   const originalClearTimeout = global.clearTimeout;
-  
-  let timeoutId: NodeJS.Timeout | undefined;
-  global.setTimeout = ((callback: any, ms?: number) => {
-    timeoutId = originalSetTimeout(callback, ms);
-    return timeoutId;
+  const originalAbort = AbortController.prototype.abort;
+
+  global.setTimeout = ((callback: any, ms?: number, ...rest: any[]) => {
+    const id = (originalSetTimeout as any)(callback, ms, ...rest);
+    delayByTimer.set(id, ms ?? 0);
+    return id;
   }) as typeof setTimeout;
-  
+
   global.clearTimeout = ((id: any) => {
-    if (id === timeoutId) {
-      timeoutCleared = true;
+    if (delayByTimer.has(id)) {
+      clearedDelays.add(delayByTimer.get(id)!);
+      delayByTimer.delete(id);
     }
-    return originalClearTimeout(id);
+    return (originalClearTimeout as any)(id);
   }) as typeof clearTimeout;
-  
+
+  AbortController.prototype.abort = function (this: AbortController): void {
+    abortCalls++;
+    originalAbort.call(this);
+  };
+
+  return {
+    restore() {
+      global.setTimeout = originalSetTimeout;
+      global.clearTimeout = originalClearTimeout;
+      AbortController.prototype.abort = originalAbort;
+    },
+    wasTimerCleared(delayMs: number) {
+      return clearedDelays.has(delayMs);
+    },
+    abortCallCount() {
+      return abortCalls;
+    },
+  };
+}
+
+test('worker processor — cleans up timer and aborts controller on success (#517)', async (t) => {
+  const mockFetch: typeof fetch = async () => ({ ok: true, status: 200 } as Response);
+
+  const spies = installCleanupSpies();
   try {
     const processor = extractProcessor(mockFetch);
     if (!processor) {
@@ -587,55 +602,25 @@ test('worker processor — cleans up timer and aborts controller on success (#51
       t.end();
       return;
     }
-    
+
     const job = makeFakeJob({ url: 'https://example.com/hook', event: {} });
     await processor(job as any);
-    
-    t.ok(timeoutCleared, 'timeout should be cleared in finally block');
-    t.ok(abortCalled, 'abort controller should be called in finally block on success path');
+
+    t.ok(spies.wasTimerCleared(WEBHOOK_DEFAULTS.timeoutMs), 'timeout should be cleared in finally block');
+    t.ok(spies.abortCallCount() >= 1, 'abort controller should be called in finally block on success path');
   } finally {
-    global.setTimeout = originalSetTimeout;
-    global.clearTimeout = originalClearTimeout;
+    spies.restore();
   }
-  
+
   t.end();
 });
 
 test('worker processor — cleans up timer and aborts controller on failure (#517)', async (t) => {
-  let abortCalledOnError = false;
-  let timeoutClearedOnError = false;
-  
-  const mockFetch: typeof fetch = async (_url, init) => {
-    // Track abort calls during error path
-    if (init?.signal) {
-      const controller = (init as any)._controller;
-      if (controller) {
-        const originalAbort = controller.abort.bind(controller);
-        controller.abort = () => {
-          abortCalledOnError = true;
-          originalAbort();
-        };
-      }
-    }
+  const mockFetch: typeof fetch = async () => {
     throw new Error('Network failure');
   };
-  
-  const originalSetTimeout = global.setTimeout;
-  const originalClearTimeout = global.clearTimeout;
-  
-  let timeoutId: NodeJS.Timeout | undefined;
-  global.setTimeout = ((callback: any, ms?: number) => {
-    timeoutId = originalSetTimeout(callback, ms);
-    return timeoutId;
-  }) as typeof setTimeout;
-  
-  global.clearTimeout = ((id: any) => {
-    if (id === timeoutId) {
-      timeoutClearedOnError = true;
-    }
-    return originalClearTimeout(id);
-  }) as typeof clearTimeout;
-  
+
+  const spies = installCleanupSpies();
   try {
     const processor = extractProcessor(mockFetch);
     if (!processor) {
@@ -643,30 +628,26 @@ test('worker processor — cleans up timer and aborts controller on failure (#51
       t.end();
       return;
     }
-    
+
     const job = makeFakeJob({ url: 'https://example.com/hook', event: {} });
-    
+
     try {
       await processor(job as any);
       t.fail('processor should have thrown');
     } catch (err) {
       t.ok(err instanceof Error && err.message.includes('Network failure'), 'error propagated');
     }
-    
-    t.ok(timeoutClearedOnError, 'timeout should be cleared in finally block on error path');
-    // Note: abort tracking on error path is harder without modifying AbortController prototype
-    // The important guarantee is clearTimeout happens in finally, which we verified
+
+    t.ok(spies.wasTimerCleared(WEBHOOK_DEFAULTS.timeoutMs), 'timeout should be cleared in finally block on error path');
+    t.ok(spies.abortCallCount() >= 1, 'abort controller should be called in finally block on error path');
   } finally {
-    global.setTimeout = originalSetTimeout;
-    global.clearTimeout = originalClearTimeout;
+    spies.restore();
   }
-  
+
   t.end();
 });
 
 test('worker processor — finally block prevents timer leak on timeout abort (#517)', async (t) => {
-  let timeoutClearedAfterAbort = false;
-  
   const mockFetch: typeof fetch = (_url, init) => {
     return new Promise((_resolve, reject) => {
       // Simulate abort firing
@@ -675,48 +656,36 @@ test('worker processor — finally block prevents timer leak on timeout abort (#
       });
     });
   };
-  
-  const originalSetTimeout = global.setTimeout;
-  const originalClearTimeout = global.clearTimeout;
-  
-  let timeoutId: NodeJS.Timeout | undefined;
-  global.setTimeout = ((callback: any, ms?: number) => {
-    timeoutId = originalSetTimeout(callback, ms);
-    return timeoutId;
-  }) as typeof setTimeout;
-  
-  global.clearTimeout = ((id: any) => {
-    if (id === timeoutId) {
-      timeoutClearedAfterAbort = true;
-    }
-    return originalClearTimeout(id);
-  }) as typeof clearTimeout;
-  
+
+  // Use a short timeout so the test doesn't wait the 5 s production default.
+  const SHORT_TIMEOUT_MS = 50;
+  const spies = installCleanupSpies();
+
   try {
-    const processor = extractProcessor(mockFetch);
+    const processor = extractProcessor(mockFetch, undefined, undefined, { timeoutMs: SHORT_TIMEOUT_MS });
     if (!processor) {
       t.pass('Worker constructor unavailable (no Redis) — leak test skipped');
       t.end();
       return;
     }
-    
+
     const job = makeFakeJob({ url: 'https://example.com/hook', event: {} });
-    
+
     try {
       await processor(job as any);
     } catch (err) {
       t.ok(err instanceof Error && err.name === 'AbortError', 'abort error thrown');
     }
-    
-    t.ok(timeoutClearedAfterAbort, 'timer must be cleared even when abort fires (prevents leak)');
-  } finally {
-    global.setTimeout = originalSetTimeout;
-    global.clearTimeout = originalClearTimeout;
-  }
-  
-// ── Part 6: HMAC-SHA256 webhook signing ──────────────────────────────────────
 
-import crypto from 'crypto';
+    t.ok(spies.wasTimerCleared(SHORT_TIMEOUT_MS), 'timer must be cleared even when abort fires (prevents leak)');
+  } finally {
+    spies.restore();
+  }
+
+  t.end();
+});
+
+// ── Part 6: HMAC-SHA256 webhook signing ──────────────────────────────────────
 
 test('signPayload — returns correctly formatted header', (t) => {
   const secret = 'test-secret-123';

@@ -46,6 +46,19 @@ function fakeRedis(startAt = 1_700_000_000_000) {
       entries.set(key, { value, expiresAt: clock + ttlMs });
       return 'OK';
     },
+    // Emulates the Lua GET+DEL script used by consume(): the key is read and
+    // deleted atomically, honouring TTL exactly like Redis would — a key past
+    // its TTL behaves as missing. Extra script/numKeys args are accepted for
+    // signature compatibility and validated loosely.
+    async eval(script, numKeys, ...args) {
+      if (typeof script !== 'string' || numKeys !== 1 || args.length < 1) {
+        throw new Error('unexpected eval call shape');
+      }
+      const key = args[0];
+      const entry = live(key);
+      entries.delete(key);
+      return entry ? entry.value : null;
+    },
     async getdel(key) {
       const entry = live(key);
       entries.delete(key);
@@ -77,7 +90,11 @@ test('issuing a challenge stores it under a TTL', async (t) => {
 
   const issued = await store.issue(ADDRESS);
 
-  t.equal(issued.challenge.length, 64, 'a 32-byte challenge is generated');
+  t.equal(
+    issued.challenge.length,
+    65,
+    'a challenge is generated (32-byte nonce + 32-byte secret, colon-joined)',
+  );
   t.equal(
     issued.expiresAt,
     redis.now() + WALLET_CHALLENGE_TTL_MS,
@@ -224,7 +241,7 @@ test('a corrupt record is discarded rather than trusted', async (t) => {
 test('Redis failures surface to the caller', async (t) => {
   const failing: WalletChallengeRedis = {
     async set() { throw new Error('Redis connection failed'); },
-    async getdel() { throw new Error('Redis connection failed'); },
+    async eval() { throw new Error('Redis connection failed'); },
     async del() { throw new Error('Redis connection failed'); },
   };
   const store = new WalletChallengeStore(failing);
@@ -248,6 +265,9 @@ function stubRedis(redis: ReturnType<typeof fakeRedis>) {
     sinon.stub(Redis.prototype, 'set').callsFake((...args: any[]) =>
       redis.set(args[0], args[1], args[2], args[3]) as any,
     ),
+    sinon.stub(Redis.prototype, 'eval').callsFake((...args: any[]) =>
+      (redis.eval as any)(args[0], args[1], ...args.slice(2)) as any,
+    ),
     sinon.stub(Redis.prototype, 'getdel').callsFake((key: any) => redis.getdel(key) as any),
     sinon.stub(Redis.prototype, 'del').callsFake((key: any) => redis.del(key) as any),
   ];
@@ -270,12 +290,18 @@ async function withApp(
 }
 
 const challengeRequest = (app: any) =>
-  app.inject({ method: 'POST', url: '/api/auth/challenge', payload: { address: ADDRESS } });
+  app.inject({
+    method: 'POST',
+    url: '/api/auth/challenge',
+    headers: { 'x-csrf-check': '1' },
+    payload: { address: ADDRESS },
+  });
 
 const verifyRequest = (app: any, signature = 'aa'.repeat(64)) =>
   app.inject({
     method: 'POST',
     url: '/api/auth/verify',
+    headers: { 'x-csrf-check': '1' },
     payload: { address: ADDRESS, signature },
   });
 

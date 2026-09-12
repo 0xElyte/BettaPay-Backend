@@ -41,6 +41,12 @@ export function generateStellarKeypair(): { publicKey: string; secretKey: string
 
 // Convert decimal string to stroops (string of integer stroops)
 export function toStellarAmount(decimalStr: string, decimals = 7): string {
+  // Strict format: one or more digits, optionally followed by a decimal point
+  // and one or more digits. Rejects empty strings, negatives, scientific
+  // notation, whitespace, and partial decimals like '.5' or '1.'.
+  if (!/^\d+(\.\d+)?$/.test(decimalStr)) {
+    throw new TypeError('toStellarAmount: input must be a valid numeric string');
+  }
   // naive conversion: multiply decimal by 10^decimals
   const [whole, frac = ''] = decimalStr.split('.');
   const paddedFrac = (frac + '0'.repeat(decimals)).slice(0, decimals);

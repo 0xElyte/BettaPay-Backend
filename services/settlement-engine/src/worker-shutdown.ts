@@ -65,6 +65,12 @@ export async function drainActiveJobs(
   }
 
   const stuckJob = getActiveJob();
+  if (!stuckJob) {
+    // The job finished between the last poll and the deadline — the drain
+    // still succeeded, so report completion instead of a false exhaustion.
+    log.info({ workerName }, 'No active jobs — drain complete');
+    return true;
+  }
   log.warn(
     { workerName, jobId: stuckJob?.id, jobData: stuckJob?.data },
     'Drain budget exhausted with job still in-flight — proceeding with forced close',

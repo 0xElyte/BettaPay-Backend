@@ -1,5 +1,5 @@
 import test from 'tape';
-import { fastify, prisma, settlementQueue } from './index.js';
+import { fastify, prisma, settlementQueue, closeTestResources } from './index.js';
 import { MOCK_MERCHANT_STANDARD, BATCH_VALID_STANDARD } from './test-fixtures.js';
 
 // Setup environment variable for tests
@@ -170,3 +170,11 @@ test('bulk-webhook: rejects a reserved header name from merchant settings (does 
   t.end();
 });
 export {};
+
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
+  t.end();
+});

@@ -23,6 +23,8 @@
 import BigNumber from "bignumber.js";
 import type { Amount } from "@bettapay/shared-types";
 import { feeSnapshotSchema } from "@bettapay/validation";
+import type { FeeScheduleItem } from "@bettapay/validation";
+import { ASSET_PRECISION_MAPPINGS } from "./settlement-properties.js";
 
 // Always round DOWN (conservative/banker-safe), never use scientific notation
 BigNumber.config({
@@ -101,8 +103,11 @@ export function getMaxSettlementAmountForAsset(asset?: string): string {
   if (!asset) return MAX_SETTLEMENT_AMOUNT;
   const normalized = asset.toUpperCase();
   const config = ASSET_PRECISION_MAPPINGS[normalized];
-  const decimals = config?.decimals ?? 2;
-  return new BN(MAX_SETTLEMENT_BASE_UNITS).multipliedBy(new BN(10).pow(decimals)).toFixed(0);
+  // Unknown assets fall back to the legacy absolute cap — a made-up precision
+  // must never silently lower (or raise) the limit.
+  if (!config) return MAX_SETTLEMENT_AMOUNT;
+  const decimals = config.decimals;
+  return new BigNumber(MAX_SETTLEMENT_BASE_UNITS).multipliedBy(new BigNumber(10).pow(decimals)).toFixed(0);
 }
 
 /**
@@ -169,7 +174,7 @@ export function computeSettlementAmounts(
   discountTiers: DiscountTier[] = [],
   asset?: string,
 ): SettlementAmounts {
-  const gross = new BN(grossAmountStr);
+  const gross = new BigNumber(grossAmountStr);
 
   // Guard: reject amounts that exceed the maximum allowed settlement amount (#481).
   // Per-asset cap is derived from the asset's decimal precision.

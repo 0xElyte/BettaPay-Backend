@@ -88,6 +88,13 @@ export function decrypt(encrypted: string, password: string): string {
   // Decode base64
   const combined = Buffer.from(encrypted, 'base64');
 
+  const MIN_LENGTH = SALT_LENGTH + IV_LENGTH + AUTH_TAG_LENGTH;
+  if (combined.length < MIN_LENGTH) {
+    throw new Error(
+      `decrypt: invalid payload — expected at least ${MIN_LENGTH} bytes, got ${combined.length}`,
+    );
+  }
+
   // Extract components
   const salt = combined.subarray(0, SALT_LENGTH);
   const iv = combined.subarray(SALT_LENGTH, SALT_LENGTH + IV_LENGTH);

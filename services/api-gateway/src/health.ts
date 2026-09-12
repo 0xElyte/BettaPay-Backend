@@ -49,7 +49,9 @@ export async function buildGatewayHealthResponse(
     startTime,
     dependencies: [postgresql],
     upstream: [fxEngine, settlementEngine, indexer],
-    criticalDependencyNames: ['postgresql'],
+    // Readiness contract: the gateway cannot serve payments/quotes without its
+    // database AND its downstream engines, so all of them gate the 503.
+    criticalDependencyNames: ['postgresql', 'fx-engine', 'settlement-engine', 'indexer'],
   });
 
   // Include abandoned payments count in non-test environments

@@ -1548,7 +1548,7 @@ fastify.post<{ Body: z.infer<typeof BulkSettlementBody> }>(
         }
         throw error;
       }
-      const { grossAmount, feeAmount, netAmount } = itemResult;
+      const { grossAmount, feeAmount, netAmount, feeSnapshot } = itemResult;
       const settlementId = 'set_' + crypto.randomUUID().replace(/-/g, '');
 
       validItems.push({
@@ -1958,6 +1958,41 @@ const start = async () => {
 };
 
 export { fastify, prisma, redis, settlementQueue };
+
+/**
+ * Test-only teardown: closes every module-scope resource (Fastify, metrics
+ * server, BullMQ workers/queues, Redis, Prisma/pg pool) so tape processes
+ * exit instead of hanging on open handles. Never calls process.exit —
+ * unlike gracefulShutdown above, which is for the real server process.
+ */
+export async function closeTestResources(): Promise<void> {
+  const step = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
+    await Promise.race([
+      fn().catch((err) => {
+        fastify.log.warn({ err, step: name }, 'test teardown step failed');
+      }),
+      new Promise<void>((resolve) =>
+        setTimeout(() => {
+          fastify.log.warn({ step: name }, 'test teardown step timed out, continuing');
+          resolve();
+        }, 5000),
+      ),
+    ]);
+  };
+  await step('fastify', () => fastify.close());
+  await step('metrics', () => new Promise<void>((resolve) => metricsServer.close(() => resolve())));
+  await step('worker', () => worker.close());
+  await step('batchWorker', () => batchWorker.close());
+  await step('webhookWorker', () => webhookWorker.close());
+  await step('settlementQueue', () => settlementQueue.close());
+  await step('settlementDLQ', () => settlementDLQ.close());
+  await step('batchQueue', () => batchQueue.close());
+  await step('webhookQueue', () => webhookQueue.close());
+  await step('redis', () => redis.quit());
+  redis.disconnect();
+  await step('prisma', () => prisma.$disconnect());
+  await step('pool', () => pool.end());
+}
 
 const isDirectRun = 
   !process.argv[1] || 

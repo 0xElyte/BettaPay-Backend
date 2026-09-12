@@ -1,5 +1,5 @@
 import test from 'tape';
-import { prisma, SettlementStatusTransitions, validateTransition } from './index.js';
+import { prisma, SettlementStatusTransitions, validateTransition, closeTestResources } from './index.js';
 
 test('Settlement state machine: validates correct transitions', (t) => {
   t.doesNotThrow(() => {
@@ -38,5 +38,13 @@ test('Settlement state machine: rejects invalid transitions', (t) => {
     validateTransition('failed', 'processing');
   }, /Invalid status transition/, 'rejects failed -> processing');
 
+  t.end();
+});
+
+// Closes module-scope Fastify/Redis/BullMQ/Prisma handles so the tape
+// process exits instead of hanging (see closeTestResources in index.ts).
+test('teardown: release shared service resources', async (t) => {
+  await closeTestResources();
+  t.pass('resources released');
   t.end();
 });

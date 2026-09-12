@@ -60,6 +60,14 @@ import {
   decryptSensitiveFields,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
+import {
+  resolveRateLimitIdentity,
+  buildRateLimitKey,
+  buildIpRateLimitKey,
+  needsNestedIpLimit,
+  rateLimitIdentityOf,
+  type RateLimitRequestLike,
+} from "./rate-limit-key.js";
 import { createFxClient } from "./clients/fx-client.js";
 import {
   createIndexerClient,
@@ -517,20 +525,173 @@ export function buildApp(opts: AppOptions = {}) {
     },
   });
 
-  // Rate limiting: global default and route overrides
+  // Rate limiting: global default and route overrides.
+  // Issue #559 — the primary bucket is keyed per authenticated merchant
+  // (falling back to the client IP for anonymous traffic) so merchants
+  // sharing one NAT address cannot throttle each other.
+  const GLOBAL_RATE_LIMIT_MAX = 1000;
   const isRateLimitDisabled = () =>
     process.env.RATE_LIMIT_ENABLED === 'false' || process.env.RATE_LIMIT_ENABLED === '0';
 
+  const rateLimitVerify = (token: string): unknown =>
+    (fastify.jwt as { verify: (t: string) => unknown }).verify(token);
+
+  const merchantKeyGenerator = (request: any): string =>
+    buildRateLimitKey(
+      rateLimitIdentityOf(request as RateLimitRequestLike, rateLimitVerify),
+    );
+
+  // NOTE: this registration is retained only as the provider of the
+  // createRateLimit decorator used below. The plugin attaches its per-route
+  // enforcement via onRoute, which fires when routes are defined — but
+  // buildApp is synchronous and defines routes before the (unawaited) plugin
+  // executes, so the plugin's own hooks never attach to any route. Primary
+  // enforcement therefore happens explicitly in the hook below.
   fastify.register(rateLimit, {
-    max: 1000,
+    max: GLOBAL_RATE_LIMIT_MAX,
     timeWindow: "1 minute",
     skip: () => isRateLimitDisabled(),
+    keyGenerator: merchantKeyGenerator,
+    errorResponseBuilder: (_request: any, context: { after: string }) =>
+      ({
+        statusCode: 429,
+        ...createErrorResponse(
+          ErrorCodes.RATE_LIMITED,
+          `Rate limit exceeded, retry in ${context.after}`,
+        ),
+      }) as any,
     addHeaders: {
       "x-ratelimit-limit": true,
       "x-ratelimit-remaining": true,
       "x-ratelimit-reset": true,
       "retry-after": true,
     },
+  });
+
+  // Primary rate-limit enforcement (see NOTE above). One checker per route,
+  // each with its own store, keyed by merchant (Issue #559). Like the
+  // plugin's global:true contract — and the onSend mirror below — every
+  // route is limited unless it opts out via `config: { rateLimit: false }`;
+  // routes without an explicit override use the global max. On success the
+  // request passes through (the mirror writes the X-RateLimit-* headers). On
+  // exhaustion we 429 here with the gateway error envelope and a Retry-After,
+  // mirroring the plugin's 429 header shape.
+  const GLOBAL_LIMITER_KEY = {};
+  const primaryLimiters = new WeakMap<
+    object,
+    (req: any) => Promise<{
+      isExceeded?: boolean;
+      max?: number;
+      ttlInSeconds?: number;
+    }>
+  >();
+  fastify.addHook("onRequest", async (request: any, reply: any) => {
+    if (isRateLimitDisabled()) return;
+    const routeConfig = request.routeOptions?.config as
+      | { rateLimit?: false | Record<string, unknown> }
+      | undefined;
+    if (routeConfig?.rateLimit === false) return;
+
+    const limiterKey = routeConfig ?? GLOBAL_LIMITER_KEY;
+    let checkPrimary = primaryLimiters.get(limiterKey);
+    if (!checkPrimary) {
+      const override =
+        routeConfig && typeof routeConfig.rateLimit === "object"
+          ? routeConfig.rateLimit
+          : {};
+      checkPrimary = fastify.createRateLimit({
+        max: GLOBAL_RATE_LIMIT_MAX,
+        timeWindow: "1 minute",
+        ...override,
+        keyGenerator: merchantKeyGenerator,
+      }) as (req: any) => Promise<{
+        isExceeded?: boolean;
+        max?: number;
+        ttlInSeconds?: number;
+      }>;
+      primaryLimiters.set(limiterKey, checkPrimary);
+    }
+
+    const result = await checkPrimary(request);
+    if (result.isExceeded === true) {
+      const ttl = result.ttlInSeconds ?? 60;
+      const max =
+        typeof result.max === "number" ? result.max : GLOBAL_RATE_LIMIT_MAX;
+      return reply
+        .code(429)
+        .header("X-RateLimit-Limit", max)
+        .header("X-RateLimit-Remaining", 0)
+        .header("X-RateLimit-Reset", ttl)
+        .header("Retry-After", String(ttl))
+        .send({
+          statusCode: 429,
+          ...createErrorResponse(
+            ErrorCodes.RATE_LIMITED,
+            "Rate limit exceeded, retry later",
+          ),
+        });
+    }
+  });
+  // Issue #559 — nested per-IP ceiling for authenticated traffic. Anonymous
+  // requests already live in the IP bucket via the primary key; authenticated
+  // requests get a second, looser check against their address so one address
+  // cannot multiply its allowance by minting merchant tokens. The ceiling is
+  // the roomier of the global and route limits so the primary bucket — not
+  // the ceiling — is what a merchant normally exhausts first. Checkers are
+  // cached per ceiling value; each carries its own store.
+  const nestedIpCheckers = new Map<
+    number,
+    (req: any) => Promise<{ isExceeded?: boolean; ttlInSeconds?: number }>
+  >();
+  fastify.addHook("onRequest", async (request: any, reply: any) => {
+    if (isRateLimitDisabled()) return;
+    const routeConfig = request.routeOptions?.config as
+      | { rateLimit?: false | Record<string, unknown> }
+      | undefined;
+    if (routeConfig?.rateLimit === false) return;
+
+    const identity = rateLimitIdentityOf(
+      request as RateLimitRequestLike,
+      rateLimitVerify,
+    );
+    if (!needsNestedIpLimit(identity)) return;
+
+    const routeMax =
+      routeConfig &&
+      typeof routeConfig.rateLimit === "object" &&
+      typeof (routeConfig.rateLimit as any).max === "number"
+        ? (routeConfig.rateLimit as any).max
+        : GLOBAL_RATE_LIMIT_MAX;
+    const ceiling = Math.max(routeMax, GLOBAL_RATE_LIMIT_MAX);
+
+    let checkNestedIpLimit = nestedIpCheckers.get(ceiling);
+    if (!checkNestedIpLimit) {
+      checkNestedIpLimit = fastify.createRateLimit({
+        max: ceiling,
+        timeWindow: "1 minute",
+        keyGenerator: (req: any) =>
+          buildIpRateLimitKey(
+            rateLimitIdentityOf(req as RateLimitRequestLike, rateLimitVerify),
+          ),
+      }) as (req: any) => Promise<{
+        isExceeded?: boolean;
+        ttlInSeconds?: number;
+      }>;
+      nestedIpCheckers.set(ceiling, checkNestedIpLimit);
+    }
+
+    const result = await checkNestedIpLimit(request);
+    if (result.isExceeded === true) {
+      return reply
+        .code(429)
+        .header("Retry-After", String(result.ttlInSeconds ?? 60))
+        .send(
+          createErrorResponse(
+            ErrorCodes.RATE_LIMITED,
+            "Rate limit exceeded for this address",
+          ),
+        );
+    }
   });
 
   // Exposes standard X-RateLimit-* response headers on every rate-limited
@@ -584,11 +745,15 @@ export function buildApp(opts: AppOptions = {}) {
 
       let checkRateLimit = rateLimitCheckers.get(routeConfig);
       if (!checkRateLimit) {
-        checkRateLimit = fastify.createRateLimit(
-          typeof routeConfig.rateLimit === "object"
+        // Mirror the primary bucket exactly: same limits, same merchant-aware
+        // key (Issue #559) — otherwise the reported remaining would track a
+        // different bucket than the one enforcing the limit.
+        checkRateLimit = fastify.createRateLimit({
+          ...(typeof routeConfig.rateLimit === "object"
             ? routeConfig.rateLimit
-            : {},
-        );
+            : {}),
+          keyGenerator: merchantKeyGenerator,
+        });
         rateLimitCheckers.set(routeConfig, checkRateLimit);
       }
 
