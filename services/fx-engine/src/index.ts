@@ -40,6 +40,7 @@ import {
   readServiceVersion,
   createRedisClient,
   waitForRedis,
+  runStartupChecks,
   startRedisMemoryMonitor,
   startMetricsServer,
   RateOverrideBody,
@@ -1707,8 +1708,26 @@ const metricsServer = startMetricsServer({
 
 const start = async () => {
   try {
-    // #391 — wait for Redis before doing anything else
-    await waitForRedis(redis, fastify.log);
+    await runStartupChecks({
+      service: "fx-engine",
+      version: SERVICE_VERSION,
+      logger: fastify.log,
+      checks: [
+        {
+          name: "redis",
+          fn: () => waitForRedis(redis, fastify.log),
+          critical: true,
+        },
+        {
+          name: "bullmq",
+          fn: async () => {
+            const counts = await cleanupQueue.getJobCounts();
+            fastify.log.info({ counts }, "BullMQ queue reachable");
+          },
+          critical: true,
+        },
+      ],
+    });
 
     // Warm up cache from latest Redis snapshot (#232)
     await warmupCacheFromRedis();

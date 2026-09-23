@@ -50,6 +50,7 @@ import {
   registerTracing,
   createRedisClient,
   waitForRedis,
+  runStartupChecks,
   startRedisMemoryMonitor,
   startMetricsServer,
   logFeatureFlags,
@@ -3383,9 +3384,23 @@ const start = async () => {
     const prisma = getDefaultPrisma();
     const redis = sharedRedis!;
 
-    // #391 — wait for dependencies before accepting traffic
-    await connectWithRetry(prisma, app.log);
-    await waitForRedis(redis, app.log);
+    await runStartupChecks({
+      service: "api-gateway",
+      version: SERVICE_VERSION,
+      logger: app.log,
+      checks: [
+        {
+          name: "prisma",
+          fn: () => connectWithRetry(prisma, app.log),
+          critical: true,
+        },
+        {
+          name: "redis",
+          fn: () => waitForRedis(redis, app.log),
+          critical: true,
+        },
+      ],
+    });
 
     // #314 — warmup downstream services with unique trace IDs
     await warmupDownstreamServices(env, app.log);
