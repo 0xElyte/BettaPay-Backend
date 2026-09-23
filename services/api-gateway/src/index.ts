@@ -58,6 +58,7 @@ import {
   decryptField,
   encryptSensitiveFields,
   decryptSensitiveFields,
+  createValidationContext,
 } from "@bettapay/validation";
 import * as promClient from "prom-client";
 import {
@@ -90,7 +91,7 @@ import {
   UpdateSupportedAssetBody,
   UpdatePaymentStatusBody,
   UpdateSettlementStatusBody,
-  UpdateMerchantSettingsBody,
+  createUpdateMerchantSettingsBody,
   UpdateMerchantNameBody,
   WalletVerifyBody,
   AuthIpScoreQuery,
@@ -205,9 +206,13 @@ function readIdempotencyKey(request: FastifyRequest): string | null {
   return (key as string).trim() || null;
 }
 
-const isProduction = process.env.NODE_ENV === "production";
+// Derive isProduction via the shared createValidationContext utility so
+// env-based branching is consistent with the rest of the validation layer
+// (cors.ts, webhookSchema.ts) rather than being duplicated ad-hoc here.
+const { isProduction } = createValidationContext();
 
 const env = validateEnvOrExit(process.env);
+const updateMerchantSettingsBody = createUpdateMerchantSettingsBody(env.NODE_ENV);
 const PORT = Number(process.env.PORT ?? "3000");
 const startTime = Date.now();
 const SERVICE_VERSION = readServiceVersion(import.meta.url);
@@ -2133,7 +2138,7 @@ fastify.get('/api/admin/auth/ip-score', {
   // settings.feeBps from here when computing fees.
   fastify.patch<{
     Params: { id: string };
-    Body: z.infer<typeof UpdateMerchantSettingsBody>;
+    Body: z.infer<typeof updateMerchantSettingsBody>;
   }>(
     "/api/merchants/:id/settings",
     {
@@ -2142,7 +2147,7 @@ fastify.get('/api/admin/auth/ip-score', {
       config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
     },
     async (request, reply) => {
-      const d = UpdateMerchantSettingsBody.parse(request.body);
+      const d = updateMerchantSettingsBody.parse(request.body);
 
       // Reject attempts to set kycStatus via the merchant settings endpoint
       if ("kycStatus" in (request.body as Record<string, unknown>)) {
