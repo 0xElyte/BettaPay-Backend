@@ -118,6 +118,14 @@ export const EnvSchema = z
       .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
       .default("info"),
 
+    // Fraction of inbound requests that should be marked for trace sampling.
+    // Route config can override this value for targeted debugging.
+    TRACE_SAMPLE_RATE: z
+      .string()
+      .default("1")
+      .transform((value) => Number(value))
+      .pipe(z.number().finite().min(0).max(1)),
+
     // Fees — default basis points applied when a merchant has no custom fee rule.
     FEES_DEFAULT_BPS: z
       .string()
