@@ -87,6 +87,7 @@ import {
 import {
   CreateMerchantBody,
   CreatePaymentBody,
+  AMOUNT_PRECISION_ERROR,
   CreateSettlementBody,
   CreateSupportedAssetBody,
   UpdateSupportedAssetBody,
@@ -2257,7 +2258,28 @@ fastify.get('/api/admin/auth/ip-score', {
     },
     async (request, reply) => {
       // ── 1. Parse and validate request body ──────────────────────────────────────
-      const d = CreatePaymentBody.parse(request.body);
+      let d: z.infer<typeof CreatePaymentBody>;
+      try {
+        d = CreatePaymentBody.parse(request.body);
+      } catch (err) {
+        if (err instanceof z.ZodError) {
+          const isPrecisionError = err.errors.some(
+            (issue) => issue.message === AMOUNT_PRECISION_ERROR,
+          );
+          return reply
+            .code(isPrecisionError ? 422 : 400)
+            .send(
+              createErrorResponse(
+                ErrorCodes.VALIDATION_ERROR,
+                isPrecisionError
+                  ? "Amount has too many decimal places for the selected asset"
+                  : "Invalid payment request",
+                err.errors,
+              ),
+            );
+        }
+        throw err;
+      }
 
       // ── 1b. Merchant must exist, be active (not soft-deleted) and not suspended ──
       const merchant = await prisma.merchant.findFirst({

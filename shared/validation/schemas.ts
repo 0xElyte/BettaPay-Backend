@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { CurrencyCode } from "./currency.js";
+import { CurrencyCode, validateAmountPrecision } from "./currency.js";
 import { validateStellarAddress } from "@bettapay/stellar-utils";
 import { WebhookHeadersSchema, createWebhookUrlSchema } from "./webhookSchema.js";
 
@@ -40,6 +40,19 @@ export const SettlementAmountString = AmountString.refine(
       "Settlement amount exceeds maximum allowed (1,000,000,000,000,000)",
   },
 );
+
+export const AMOUNT_PRECISION_ERROR = "Amount exceeds the maximum decimal places for this asset";
+
+function addAmountPrecisionIssue(
+  amount: string,
+  asset: string,
+  ctx: z.RefinementCtx,
+  path: (string | number)[] = ["amount"],
+): void {
+  if (!validateAmountPrecision(amount, asset)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path, message: AMOUNT_PRECISION_ERROR });
+  }
+}
 
 export const StellarAddressSchema = z.string().refine(validateStellarAddress, {
   message: "Invalid Stellar public key",
@@ -394,15 +407,17 @@ export const CreateMerchantBody = z.object({
     .optional(),
 });
 
-export const CreatePaymentBody = z.object({
-  merchantId: StellarAddressSchema,
-  amount: z.string().regex(/^\d+(\.\d+)?$/, "amount must be a numeric string"),
-  asset: CurrencyCode,
-  convertTo: CurrencyCode.optional(),
-  payerId: z.string().optional(),
-  reference: z.string().optional(),
-  idempotencyKey: IdempotencyKeySchema.optional(),
-});
+export const CreatePaymentBody = z
+  .object({
+    merchantId: StellarAddressSchema,
+    amount: AmountString,
+    asset: CurrencyCode,
+    convertTo: CurrencyCode.optional(),
+    payerId: z.string().optional(),
+    reference: z.string().optional(),
+    idempotencyKey: IdempotencyKeySchema.optional(),
+  })
+  .superRefine((data, ctx) => addAmountPrecisionIssue(data.amount, data.asset, ctx));
 
 export const CreateSettlementBody = z
   .object({
@@ -419,6 +434,12 @@ export const CreateSettlementBody = z
       .optional(),
     idempotencyKey: IdempotencyKeySchema.optional(),
   })
+  .superRefine((data, ctx) => {
+    if (data.amount && data.asset) addAmountPrecisionIssue(data.amount, data.asset, ctx);
+    data.items?.forEach((item, index) =>
+      addAmountPrecisionIssue(item.amount, item.asset, ctx, ["items", index, "amount"]),
+    );
+  })
   .refine(
     (data) => {
       // Either single amount/asset OR items array must be provided, not both
@@ -431,15 +452,21 @@ export const CreateSettlementBody = z
     },
   );
 
-export const BulkSettlementBody = z.object({
-  merchantId: z.string().regex(/^[A-Za-z0-9_]+$/, "Invalid merchantId"),
-  settlements: z.array(
-    z.object({
-      amount: SettlementAmountString,
-      asset: CurrencyCode,
-    }),
-  ),
-});
+export const BulkSettlementBody = z
+  .object({
+    merchantId: z.string().regex(/^[A-Za-z0-9_]+$/, "Invalid merchantId"),
+    settlements: z.array(
+      z.object({
+        amount: SettlementAmountString,
+        asset: CurrencyCode,
+      }),
+    ),
+  })
+  .superRefine((data, ctx) => {
+    data.settlements.forEach((item, index) =>
+      addAmountPrecisionIssue(item.amount, item.asset, ctx, ["settlements", index, "amount"]),
+    );
+  });
 
 export const AuthTokenBody = z.object({
   merchantId: StellarAddressSchema,
